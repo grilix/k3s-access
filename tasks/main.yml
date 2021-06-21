@@ -1,0 +1,199 @@
+- name: Directorio local de claves existe
+  file:
+    path: "files/keys/{{ inventory_hostname }}"
+    state: directory
+  delegate_to: localhost
+
+- name: El usuario tiene una clave privada
+  openssl_privatekey:
+    path: "files/keys/{{ client_user }}.pem"
+    size: "4096"
+    type: "RSA"
+  register: generate_private_key
+  delegate_to: localhost
+
+- name: Comprobar si existe el CA del cluster
+  stat:
+    path: "files/keys/{{ inventory_hostname }}/k8s-ca.crt"
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  register: cluster_ca
+  delegate_to: localhost
+
+- name: Borrar certificado inválido del usuario
+  file:
+    path: "files/keys/{{ inventory_hostname }}/{{ client_user }}.crt"
+    state: absent
+  # El certificado depende de la clave privada y el ca del cluster,
+  # por lo tanto si una de ellas cambia, será inválido.
+  when: generate_private_key.changed or (not cluster_ca.stat.exists)
+  delegate_to: localhost
+
+- name: Comprobar si el usuario tiene un certificado
+  stat:
+    path: "files/keys/{{ inventory_hostname }}/{{ client_user }}.crt"
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  register: client_certificate
+  delegate_to: localhost
+
+- name: Generar petición de firma
+  community.crypto.openssl_csr_pipe:
+    privatekey_path: "files/keys/{{ client_user }}.pem"
+    common_name: "{{ client_user }}-{{ inventory_hostname }}"
+    organization_name: "devops" # TODO: ?
+  when: not client_certificate.stat.exists
+  register: generate_csr
+  delegate_to: localhost
+
+- name: Paquetes de sistema instalados
+  become: true
+  apt:
+    name:
+      - python3-pip
+    state: present
+
+- name: Paquetes pip instalados
+  pip:
+    name:
+      - openshift
+    state: present
+  when: not client_certificate.stat.exists
+
+- name: Registrar petición de firma
+  community.kubernetes.k8s:
+    state: present
+    wait: true
+    wait_condition:
+      reason: "status.conditions[*].type=(Pending|Approved|Issued)"
+    definition:
+      apiVersion: certificates.k8s.io/v1
+      kind: CertificateSigningRequest
+      metadata:
+        name: "{{ client_user }}-k8s-access"
+      spec:
+        groups:
+          - system:authenticated
+          - system:admin
+        request: "{{ generate_csr.csr | b64encode }}"
+        signerName: kubernetes.io/kube-apiserver-client
+        usages:
+          - client auth
+  when: not client_certificate.stat.exists
+
+- name: Petición aprobada
+  become: true
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - certificate
+      - approve
+      - "{{ client_user }}-k8s-access"
+  register: approve_signature
+  when: not client_certificate.stat.exists
+
+- name: Certificado emitido
+  when: not client_certificate.stat.exists
+  register: certificate_signing_requests
+  retries: 3
+  delay: 2
+  until: |
+    certificate_signing_requests.resources |
+    map(attribute='status.conditions') | flatten |
+    selectattr('type', 'equalto', 'Approved') | list | count == 1
+  community.kubernetes.k8s_info:
+    api_version: certificates.k8s.io/v1
+    kind: CertificateSigningRequest
+    name: "{{ client_user }}-k8s-access"
+
+- name: Certificado guardado
+  when: not client_certificate.stat.exists
+  vars:
+    csr: "{{ certificate_signing_requests.resources[0] }}"
+  template:
+    src: templates/certificate.crt.j2
+    dest: "files/keys/{{ inventory_hostname }}/{{ client_user }}.crt"
+  delegate_to: localhost
+
+- name: Permisos otorgados al usuario
+  community.kubernetes.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: "{{ client_user }}-admin"
+      subjects:
+        - kind: User
+          name: "{{ client_user }}-{{ inventory_hostname }}"
+          apiGroup: rbac.authorization.k8s.io
+      roleRef:
+        kind: ClusterRole
+        name: cluster-admin
+        apiGroup: rbac.authorization.k8s.io
+
+- name: Obtener certificado del cluster
+  become: true
+  when: not cluster_ca.stat.exists
+  shell: |
+    kubectl config view \
+    -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' --raw | \
+    base64 --decode -
+  register: cluster_ca_export
+
+- name: Certificado del cluster guardado
+  template:
+    src: stdout.j2
+    dest: "files/keys/{{ inventory_hostname }}/k8s-ca.crt"
+  vars:
+    stdout: "{{ cluster_ca_export.stdout }}"
+  when: cluster_ca_export.changed
+  delegate_to: localhost
+
+- name: Comprobar si el endpoint está guardado
+  stat:
+    path: "files/keys/{{ inventory_hostname }}/endpoint.txt"
+  register: endpoint_check
+  delegate_to: localhost
+
+- name: Endpoint exportado
+  become: true
+  shell: |
+    CONTEXT=$(kubectl config current-context)
+    NAME=$(kubectl config get-contexts $CONTEXT | awk '{print $3}' | tail -n 1)
+    kubectl config view \
+      -o jsonpath="{.clusters[?(@.name == \"$NAME\")].cluster.server}" | \
+                   sed 's/127.0.0.1/{{ ansible_ssh_host }}/'
+  register: cluster_endpoint
+  when: not endpoint_check.stat.exists
+
+- name: Endpoint guardado
+  template:
+    src: stdout.j2
+    dest: "files/keys/{{ inventory_hostname }}/endpoint.txt"
+  vars:
+    stdout: "{{ cluster_endpoint.stdout }}"
+  when: not endpoint_check.stat.exists
+  delegate_to: localhost
+
+# FIXME: Esto podría ser mucho más mejor. Creo.
+- name: Configurar acceso al cluster
+  shell: |
+    kubectl config set-cluster "{{ cluster_name }}" \
+      --embed-certs=true \
+      --server="$(cat files/keys/{{ inventory_hostname }}/endpoint.txt)" \
+      --certificate-authority="files/keys/{{ inventory_hostname }}/k8s-ca.crt"
+
+    kubectl config set-credentials "{{ client_user }}-{{ inventory_hostname }}" \
+      --embed-certs \
+      --client-certificate="files/keys/{{ inventory_hostname }}/{{ client_user }}.crt" \
+      --client-key="files/keys/{{ client_user }}.pem"
+
+    kubectl config set-context "{{ client_user }}-{{ inventory_hostname }}" \
+      --cluster="{{ cluster_name }}" \
+      --user="{{ client_user }}-{{ inventory_hostname }}"
+
+    kubectl config use-context "{{ client_user }}-{{ inventory_hostname }}"
+  delegate_to: localhost
