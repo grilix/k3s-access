@@ -1,12 +1,6 @@
-- name: Directorio local de claves existe
-  file:
-    path: "files/keys/{{ inventory_hostname }}"
-    state: directory
-  delegate_to: localhost
-
 - name: El usuario tiene una clave privada
   openssl_privatekey:
-    path: "files/keys/{{ client_user }}.pem"
+    path: "{{ k3s_cluster_local_path }}/{{ k3s_client_name }}.pem"
     size: "4096"
     type: "RSA"
   register: generate_private_key
@@ -14,7 +8,7 @@
 
 - name: Comprobar si existe el CA del cluster
   stat:
-    path: "files/keys/{{ inventory_hostname }}/k8s-ca.crt"
+    path: "{{ k3s_cluster_local_path }}/k8s-ca.crt"
     get_checksum: false
     get_mime: false
     get_attributes: false
@@ -23,7 +17,7 @@
 
 - name: Borrar certificado inválido del usuario
   file:
-    path: "files/keys/{{ inventory_hostname }}/{{ client_user }}.crt"
+    path: "{{ k3s_cluster_local_path }}/{{ k3s_client_name }}.crt"
     state: absent
   # El certificado depende de la clave privada y el ca del cluster,
   # por lo tanto si una de ellas cambia, será inválido.
@@ -32,7 +26,7 @@
 
 - name: Comprobar si el usuario tiene un certificado
   stat:
-    path: "files/keys/{{ inventory_hostname }}/{{ client_user }}.crt"
+    path: "{{ k3s_cluster_local_path }}/{{ k3s_client_name }}.crt"
     get_checksum: false
     get_mime: false
     get_attributes: false
@@ -41,8 +35,8 @@
 
 - name: Generar petición de firma
   community.crypto.openssl_csr_pipe:
-    privatekey_path: "files/keys/{{ client_user }}.pem"
-    common_name: "{{ client_user }}-{{ inventory_hostname }}"
+    privatekey_path: "{{ k3s_cluster_local_path }}/{{ k3s_client_name }}.pem"
+    common_name: "{{ k3s_client_name }}-{{ k3s_cluster_name }}"
     organization_name: "devops" # TODO: ?
   when: not client_certificate.stat.exists
   register: generate_csr
@@ -72,7 +66,7 @@
       apiVersion: certificates.k8s.io/v1
       kind: CertificateSigningRequest
       metadata:
-        name: "{{ client_user }}-k8s-access"
+        name: "{{ k3s_client_name }}-k8s-access"
       spec:
         groups:
           - system:authenticated
@@ -90,7 +84,7 @@
       - kubectl
       - certificate
       - approve
-      - "{{ client_user }}-k8s-access"
+      - "{{ k3s_client_name }}-k8s-access"
   register: approve_signature
   when: not client_certificate.stat.exists
 
@@ -106,7 +100,7 @@
   community.kubernetes.k8s_info:
     api_version: certificates.k8s.io/v1
     kind: CertificateSigningRequest
-    name: "{{ client_user }}-k8s-access"
+    name: "{{ k3s_client_name }}-k8s-access"
 
 - name: Certificado guardado
   when: not client_certificate.stat.exists
@@ -114,7 +108,7 @@
     csr: "{{ certificate_signing_requests.resources[0] }}"
   template:
     src: templates/certificate.crt.j2
-    dest: "files/keys/{{ inventory_hostname }}/{{ client_user }}.crt"
+    dest: "{{ k3s_cluster_local_path }}/{{ k3s_client_name }}.crt"
   delegate_to: localhost
 
 - name: Permisos otorgados al usuario
@@ -124,10 +118,10 @@
       apiVersion: rbac.authorization.k8s.io/v1
       kind: ClusterRoleBinding
       metadata:
-        name: "{{ client_user }}-admin"
+        name: "{{ k3s_client_name }}-admin"
       subjects:
         - kind: User
-          name: "{{ client_user }}-{{ inventory_hostname }}"
+          name: "{{ k3s_client_name }}-{{ k3s_cluster_name }}"
           apiGroup: rbac.authorization.k8s.io
       roleRef:
         kind: ClusterRole
@@ -146,54 +140,28 @@
 - name: Certificado del cluster guardado
   template:
     src: stdout.j2
-    dest: "files/keys/{{ inventory_hostname }}/k8s-ca.crt"
+    dest: "{{ k3s_cluster_local_path }}/k8s-ca.crt"
   vars:
     stdout: "{{ cluster_ca_export.stdout }}"
   when: cluster_ca_export.changed
   delegate_to: localhost
 
-- name: Comprobar si el endpoint está guardado
-  stat:
-    path: "files/keys/{{ inventory_hostname }}/endpoint.txt"
-  register: endpoint_check
-  delegate_to: localhost
-
-- name: Endpoint exportado
-  become: true
-  shell: |
-    CONTEXT=$(kubectl config current-context)
-    NAME=$(kubectl config get-contexts $CONTEXT | awk '{print $3}' | tail -n 1)
-    kubectl config view \
-      -o jsonpath="{.clusters[?(@.name == \"$NAME\")].cluster.server}" | \
-                   sed 's/127.0.0.1/{{ ansible_ssh_host }}/'
-  register: cluster_endpoint
-  when: not endpoint_check.stat.exists
-
-- name: Endpoint guardado
-  template:
-    src: stdout.j2
-    dest: "files/keys/{{ inventory_hostname }}/endpoint.txt"
-  vars:
-    stdout: "{{ cluster_endpoint.stdout }}"
-  when: not endpoint_check.stat.exists
-  delegate_to: localhost
-
 # FIXME: Esto podría ser mucho más mejor. Creo.
 - name: Configurar acceso al cluster
   shell: |
-    kubectl config set-cluster "{{ cluster_name }}" \
+    kubectl config set-cluster "{{ k3s_cluster_name }}" \
       --embed-certs=true \
-      --server="$(cat files/keys/{{ inventory_hostname }}/endpoint.txt)" \
-      --certificate-authority="files/keys/{{ inventory_hostname }}/k8s-ca.crt"
+      --server="{{ k3s_master_url }}" \
+      --certificate-authority="{{ k3s_cluster_local_path }}/k8s-ca.crt"
 
-    kubectl config set-credentials "{{ client_user }}-{{ inventory_hostname }}" \
+    kubectl config set-credentials "{{ k3s_client_name }}-{{ k3s_cluster_name }}" \
       --embed-certs \
-      --client-certificate="files/keys/{{ inventory_hostname }}/{{ client_user }}.crt" \
-      --client-key="files/keys/{{ client_user }}.pem"
+      --client-certificate="{{ k3s_cluster_local_path }}/{{ k3s_client_name }}.crt" \
+      --client-key="{{ k3s_cluster_local_path }}/{{ k3s_client_name }}.pem"
 
-    kubectl config set-context "{{ client_user }}-{{ inventory_hostname }}" \
-      --cluster="{{ cluster_name }}" \
-      --user="{{ client_user }}-{{ inventory_hostname }}"
+    kubectl config set-context "{{ k3s_client_name }}-{{ k3s_cluster_name }}" \
+      --cluster="{{ k3s_cluster_name }}" \
+      --user="{{ k3s_client_name }}-{{ k3s_cluster_name }}"
 
-    kubectl config use-context "{{ client_user }}-{{ inventory_hostname }}"
+    kubectl config use-context "{{ k3s_client_name }}-{{ k3s_cluster_name }}"
   delegate_to: localhost
