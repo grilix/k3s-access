@@ -151,7 +151,7 @@
   shell: |
     kubectl config set-cluster "{{ k3s_cluster_name }}" \
       --embed-certs=true \
-      --server="{{ k3s_master_url }}" \
+      --server="{{ k3s_server_url }}" \
       --certificate-authority="{{ k3s_cluster_local_path }}/k8s-ca.crt"
 
     kubectl config set-credentials "{{ k3s_client_name }}-{{ k3s_cluster_name }}" \

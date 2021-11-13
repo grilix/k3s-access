@@ -1,4 +1,4 @@
 k3s_cluster_name: "my-cluster"
 k3s_client_name: "admin"
 # k3s_cluster_local_path: "files/my-cluster"
-# k3s_master_url: "https://cluster-master:6443"
+# k3s_server_url: "https://cluster-server:6443"
