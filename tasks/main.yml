@@ -1,3 +1,4 @@
+---
 - name: El usuario tiene una clave privada
   openssl_privatekey:
     path: "{{ k3s_cluster_local_path }}/{{ k3s_client_name }}.pem"
@@ -37,7 +38,8 @@
   community.crypto.openssl_csr_pipe:
     privatekey_path: "{{ k3s_cluster_local_path }}/{{ k3s_client_name }}.pem"
     common_name: "{{ k3s_client_name }}-{{ k3s_cluster_name }}"
-    organization_name: "devops" # TODO: ?
+    subject_alt_name: "DNS:127.0.0.1:6443"  # testing for tunnels, idk
+    organization_name: "k3s"  # TODO: ?
   when: not client_certificate.stat.exists
   register: generate_csr
   delegate_to: localhost
@@ -57,7 +59,7 @@
   when: not client_certificate.stat.exists
 
 - name: Registrar petición de firma
-  community.kubernetes.k8s:
+  kubernetes.core.k8s:
     state: present
     wait: true
     wait_condition:
@@ -97,7 +99,7 @@
     certificate_signing_requests.resources |
     map(attribute='status.conditions') | flatten |
     selectattr('type', 'equalto', 'Approved') | list | count == 1
-  community.kubernetes.k8s_info:
+  kubernetes.core.k8s_info:
     api_version: certificates.k8s.io/v1
     kind: CertificateSigningRequest
     name: "{{ k3s_client_name }}-k8s-access"
@@ -112,7 +114,7 @@
   delegate_to: localhost
 
 - name: Permisos otorgados al usuario
-  community.kubernetes.k8s:
+  kubernetes.core.k8s:
     state: present
     definition:
       apiVersion: rbac.authorization.k8s.io/v1
@@ -149,19 +151,22 @@
 # FIXME: Esto podría ser mucho más mejor. Creo.
 - name: Configurar acceso al cluster
   shell: |
-    kubectl config set-cluster "{{ k3s_cluster_name }}" \
+    kubectl config \
+      set-cluster "{{ k3s_cluster_name }}" \
       --embed-certs=true \
       --server="{{ k3s_server_url }}" \
       --certificate-authority="{{ k3s_cluster_local_path }}/k8s-ca.crt"
 
-    kubectl config set-credentials "{{ k3s_client_name }}-{{ k3s_cluster_name }}" \
+    kubectl config \
+      set-credentials "{{ k3s_client_name }}@{{ k3s_cluster_name }}" \
       --embed-certs \
       --client-certificate="{{ k3s_cluster_local_path }}/{{ k3s_client_name }}.crt" \
       --client-key="{{ k3s_cluster_local_path }}/{{ k3s_client_name }}.pem"
 
-    kubectl config set-context "{{ k3s_client_name }}-{{ k3s_cluster_name }}" \
+    kubectl config \
+      set-context "{{ k3s_client_name }}@{{ k3s_cluster_name }}" \
       --cluster="{{ k3s_cluster_name }}" \
-      --user="{{ k3s_client_name }}-{{ k3s_cluster_name }}"
+      --user="{{ k3s_client_name }}@{{ k3s_cluster_name }}"
 
-    kubectl config use-context "{{ k3s_client_name }}-{{ k3s_cluster_name }}"
+    kubectl config use-context "{{ k3s_client_name }}@{{ k3s_cluster_name }}"
   delegate_to: localhost
